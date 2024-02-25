@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 )
 
+// / commands that flow through the control channel
 type handlerSync[T any] func(T)
 type removeHandlerSync uintptr
 type handlerAsync[T any] func(context.Context, T)
@@ -14,6 +15,11 @@ type removeHandlerAsync uintptr
 type newRecvChannel[T any] chan T
 type removeRecvChannel uintptr
 
+// A Pub/Sub mechanism that carries a singular message type and supports synchronous and asynchronous subscribers.
+//
+// All the messages published to the topic are broadcasted to all the subscribers via a dedicated goroutine.
+//
+// The subscribers can be synchronous or asynchronous.
 type Topic[T any] struct {
 	handlersSync  map[uintptr]handlerSync[T]
 	handlersAsync map[uintptr]handlerAsync[T]
@@ -25,6 +31,11 @@ type Topic[T any] struct {
 	closeChan   chan struct{}
 }
 
+// Sets the inbound data channel buffer size and starts the broadcast goroutine.
+//
+// Context is used to stop the broadcast goroutine when the context is canceled.
+//
+// For more details go to [Topic.Close] method.
 func NewTopic[T any](ctx context.Context, bufSize int) *Topic[T] {
 	t := &Topic[T]{
 		handlersSync:  make(map[uintptr]handlerSync[T]),
@@ -38,6 +49,9 @@ func NewTopic[T any](ctx context.Context, bufSize int) *Topic[T] {
 	return t
 }
 
+// Subscribes to the topic and invokes the given function for each message.
+//
+// ***BEWARE! The handler is executed by the broadcaster goroutine that manages the topic, which can halt the topic if the handler is expensive.
 func (t *Topic[T]) HandleSync(fn func(T)) (func(), error) {
 	if t.closed.Load() {
 		return nil, fmt.Errorf("topic is closed")
@@ -51,6 +65,9 @@ func (t *Topic[T]) HandleSync(fn func(T)) (func(), error) {
 	}, nil
 }
 
+// Spawns a new goroutine for each message and invokes the given function.
+//
+// Making use of the context is recommended for graceful shutdown.
 func (t *Topic[T]) HandleAsync(fn func(context.Context, T)) (func(), error) {
 	if t.closed.Load() {
 		return nil, fmt.Errorf("topic is closed")
@@ -64,6 +81,15 @@ func (t *Topic[T]) HandleAsync(fn func(context.Context, T)) (func(), error) {
 	}, nil
 }
 
+// Returns a receive-only channel for the topic.
+//
+// The channel is buffered with the size of bufSize.
+//
+// When the channel is full, the channel will be closed and the subscriber will be removed from the topic.
+//
+// The subscriber can remove the channel from the topic by calling the returned function.
+//
+// This is the recommended way of subscribing to the topic for most use cases.
 func (t *Topic[T]) GetRecvChannel(bufSize int) (<-chan T, func(), error) {
 	if t.closed.Load() {
 		return nil, nil, fmt.Errorf("topic is closed")
@@ -78,6 +104,14 @@ func (t *Topic[T]) GetRecvChannel(bufSize int) (<-chan T, func(), error) {
 	}, nil
 }
 
+// Closes the topic and stops the broadcast goroutine. Gets called when the context is canceled as well.
+//
+// Can be called multiple times.
+//
+//  1. Topic ignores all control commands after the close command.
+//  2. Prevents any new messages
+//  3. Finishes broadcasting the messages already sent.
+//  4. Closes without waiting for the subscribers to finish processing.
 func (t *Topic[T]) Close() {
 	if t.closed.CompareAndSwap(false, true) {
 		close(t.closeChan)
@@ -89,6 +123,9 @@ func (t *Topic[T]) Close() {
 	}
 }
 
+// Publishes a message to the topic.
+//
+// Same semantics as sending to a buffered channel.
 func (t *Topic[T]) Publish(data T) error {
 	if t.closed.Load() {
 		return fmt.Errorf("topic is closed")
