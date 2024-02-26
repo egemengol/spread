@@ -25,7 +25,7 @@ for number := range recvChan {
 ```golang
 var topic *spread.Topic[int]
 
-t.HandleAsync(func(_ctx context.Context, number int) {
+topic.HandleAsync(func(_ctx context.Context, number int) {
     fmt.Printf("Handling in async handler: %d\n", number)
 })
 ```
@@ -36,7 +36,7 @@ This blocks the topic's progress so better to keep it non-blocking.
 ```golang
 var topic *spread.Topic[int]
 
-t.HandleSync(func(number int) {
+topic.HandleSync(func(number int) {
     fmt.Printf("Handling in sync handler: %d\n", number)
 })
 ```
