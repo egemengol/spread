@@ -1,0 +1,4 @@
+github.com/egemengol/spread v0.1.2 h1:p1+ffn9eBoMAltLjYPGLqKO0ZDQwx3DUUz/JB7FMiY0=
+github.com/egemengol/spread v0.1.2/go.mod h1:JT8/nR3UG7UNr3pfNyOmaBPXIM6ZPM29J5GtVjy3GW4=
+nhooyr.io/websocket v1.8.10 h1:mv4p+MnGrLDcPlBoWsvPP7XCzTYMXP9F9eIGoKbgx7Q=
+nhooyr.io/websocket v1.8.10/go.mod h1:rN9OFWIUwuxg4fR5tELlYC04bXYowCP9GX47ivo2l+c=

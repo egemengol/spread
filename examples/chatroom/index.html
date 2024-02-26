@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spread Chatroom Example</title>
+</head>
+<body>
+  <dialog id="name-dialog">
+    <form id="name-form">
+      <label for="name">Enter your name:</label>
+      <input type="text" id="name" required>
+      <button type="submit">Submit</button>
+    </form>
+  </dialog>
+  <ul id="messages"></ul>
+  <form id="message-form">
+    <span id="name-span"></span>
+    <input type="text" id="message-input" required>
+    <button type="submit">Send</button>
+  </form>
+
+  <script>
+    const nameDialog = document.getElementById('name-dialog');
+    const nameForm = document.getElementById('name-form');
+    const messageInput = document.getElementById('message-input');
+    const messageForm = document.getElementById('message-form');
+    const nameSpan = document.getElementById('name-span');
+
+    let myName;
+    const ws = new WebSocket('ws://localhost:8000/subscribe');
+    
+    nameForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      myName = event.target.elements.name.value.trim();
+      nameSpan.textContent = myName + ': ';
+      nameDialog.close();
+      messageInput.focus();
+    });
+
+    messageForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const messageContent = event.target.elements['message-input'].value;
+      event.target.reset();
+      console.log("Sending message:", messageContent)
+      await fetch("http://localhost:8000/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: myName,
+          msg: messageContent,
+        }),
+      });
+    });
+
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data); // name, msg, at (iso)
+      const li = document.createElement('li');
+      li.textContent = message.name + ': ' + message.msg;
+      document.getElementById('messages').appendChild(li);
+    };
+
+    nameDialog.showModal();
+  </script>
+</body>
+</html>
