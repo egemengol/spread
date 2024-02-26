@@ -3,7 +3,7 @@
 [![GoDoc](https://godoc.org/github.com/egemengol/spread?status.svg&style=flat-square)](http://godoc.org/github.com/egemengol/spread)
 [![GitHub](https://img.shields.io/badge/GitHub-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/egemengol/spread)
 
-An in-process and in-memory PubSub, Broadcast or EventBus implementation with type-safe topics implemented with generics. Respects context.
+An in-process and in-memory PubSub, Broadcast, EventBus or Fanout implementation with type-safe topics implemented with generics. Respects context.
 
 ### Subscriber Patterns
 
