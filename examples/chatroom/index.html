@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Spread Chatroom Example</title>
 </head>
+
 <body>
   <dialog id="name-dialog">
     <form id="name-form">
@@ -29,7 +31,7 @@
 
     let myName;
     const ws = new WebSocket('ws://localhost:8000/subscribe');
-    
+
     nameForm.addEventListener('submit', (event) => {
       event.preventDefault();
       myName = event.target.elements.name.value.trim();
@@ -43,7 +45,7 @@
       const messageContent = event.target.elements['message-input'].value;
       event.target.reset();
       console.log("Sending message:", messageContent)
-      await fetch("http://localhost:8000/publish", {
+      await fetch("/publish", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -65,4 +67,5 @@
     nameDialog.showModal();
   </script>
 </body>
+
 </html>

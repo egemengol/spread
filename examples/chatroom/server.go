@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/egemengol/spread"
@@ -19,72 +18,69 @@ import (
 
 const ADDR = "localhost:8000"
 
-func HandlePublish(topic *spread.Topic[Message]) http.Handler {
+func HandlePublish(logger *slog.Logger, topic *spread.Topic[Message]) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var msg Message
 		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			logger.Warn("error decoding message", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		r.Body.Close()
 
-		/// SPREAD SECTION START
-		// Publish the message to the topic
+		logger.Info("publishing message", "msg", msg)
 
 		if err := topic.Publish(msg); err != nil {
+			logger.Error("error publishing message", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		/// SPREAD SECTION END
 
 		w.WriteHeader(http.StatusNoContent)
 	})
 }
 
-func HandleSubscribe(topic *spread.Topic[Message]) http.Handler {
+func HandleSubscribe(logger *slog.Logger, topic *spread.Topic[Message]) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
-			log.Printf("error accepting websocket: %s\n", err)
+			logger.Error("error accepting websocket", "err", err)
 			return
 		}
 		defer conn.CloseNow()
 
-		/// SPREAD SECTION START
-		// Subscribe to the topic, get a receive channel
-
 		recvChan, removeRecvChan, err := topic.GetRecvChannel(20)
 		if err != nil {
-			log.Printf("error getting recv channel: %s\n", err)
+			logger.Error("error getting recv channel", "err", err)
 			return
 		}
 		defer removeRecvChan()
 
+		ctx := conn.CloseRead(r.Context())
+
 		for {
 			select {
-			case <-r.Context().Done():
-				log.Printf("context done: %s\n", r.Context().Err())
+			case <-ctx.Done():
+				logger.Info("client disconnected", "err", ctx.Err())
 				return
 			case msg, ok := <-recvChan:
 				if !ok {
-					log.Fatal("topic closed the recv channel")
+					logger.Info("recv channel closed")
+					conn.Close(websocket.StatusGoingAway, "")
+					return
 				}
 				data, err := json.Marshal(msg)
 				if err != nil {
-					log.Printf("error marshaling message: %s\n", err)
+					logger.Error("error marshaling message", "err", err)
 					return
 				}
 				if err := conn.Write(r.Context(), websocket.MessageText, data); err != nil {
-					// There should be a better way of handling disconnects
-					// for now we just log the "broken pipe" error and return
-					log.Printf("error writing message: %s\n", err)
+					logger.Warn("error writing message", "err", err)
 					return
 				}
+				logger.Info("forwarded to listener", "fromUser", msg.Username, "msg", msg.Message)
 			}
 		}
-
-		/// SPREAD SECTION END
 	})
 }
 
@@ -118,22 +114,23 @@ func Run(ctx context.Context) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
 
-	/// SPREAD SECTION START
-	// Create a topic with a buffer size of 20 messages
+	baseLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := baseLogger.With("module", "chatroom")
 
-	topic := spread.NewTopic[Message](ctx, 20)
-
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(".")))
-	mux.Handle("POST /publish", HandlePublish(topic))
-	mux.Handle("/subscribe", HandleSubscribe(topic))
+	topic := spread.NewTopic[Message](ctx, nil, 20)
+	// topic := spread.NewTopic[Message](ctx, baseLogger, 20)
 
 	// Log messages flowing through the topic
 	topic.HandleSync(func(msg Message) {
-		log.Printf("%s: %s\n", msg.Username, msg.Message)
+		logger.Info("processed by the sync handler", "user", msg.Username, "msg", msg.Message)
 	})
 
-	/// SPREAD SECTION END
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "chatroom/index.html")
+	})
+	mux.Handle("POST /publish", HandlePublish(logger, topic))
+	mux.Handle("/subscribe", HandleSubscribe(logger, topic))
 
 	httpServer := &http.Server{
 		Addr:         ADDR,
@@ -143,26 +140,39 @@ func Run(ctx context.Context) error {
 	}
 
 	go func() {
-		log.Printf("listening on %s\n", httpServer.Addr)
+		logger.Info("http server started listening on", "addr", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "error listening and serving: %s\n", err)
+			logger.Error("error starting http server", "err", err)
 		}
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-ctx.Done()
-		shutdownCtx := context.Background()
-		shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			fmt.Fprintf(os.Stderr, "error shutting down http server: %s\n", err)
-		}
-	}()
-	wg.Wait()
-	return nil
+	<-ctx.Done()
+	logger.Info("received interrupt, shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("error shutting down http server", "err", err)
+	}
+	time.Sleep(100 * time.Millisecond) // Wait for websocket connections to close
+	logger.Info("shutdown complete")
+
+	return shutdownCtx.Err()
+
+	// var wg sync.WaitGroup
+	// wg.Add(1)
+	// go func() {
+	// 	defer wg.Done()
+	// 	<-ctx.Done()
+	// 	logger.Info("received interrupt, shutting down")
+	// 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 	defer cancel()
+	// 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+	// 		logger.Error("error shutting down http server", "err", err)
+	// 	}
+	// 	time.Sleep(100 * time.Millisecond) // Wait for websocket connections to close
+	// }()
+	// wg.Wait()
+	// return nil
 }
 
 func main() {

@@ -3,6 +3,8 @@ package spread
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"reflect"
 	"sync/atomic"
 )
@@ -21,6 +23,7 @@ type removeRecvChannel uintptr
 //
 // The subscribers can be synchronous or asynchronous.
 type Topic[T any] struct {
+	log           *slog.Logger
 	handlersSync  map[uintptr]handlerSync[T]
 	handlersAsync map[uintptr]handlerAsync[T]
 	recvChannels  map[uintptr]chan T
@@ -36,7 +39,10 @@ type Topic[T any] struct {
 // Context is used to stop the broadcast goroutine when the context is canceled.
 //
 // For more details go to [Topic.Close] method.
-func NewTopic[T any](ctx context.Context, bufSize int) *Topic[T] {
+func NewTopic[T any](ctx context.Context, logger *slog.Logger, bufSize int) *Topic[T] {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	t := &Topic[T]{
 		handlersSync:  make(map[uintptr]handlerSync[T]),
 		handlersAsync: make(map[uintptr]handlerAsync[T]),
@@ -45,6 +51,7 @@ func NewTopic[T any](ctx context.Context, bufSize int) *Topic[T] {
 		dataChan:      make(chan T, bufSize),
 		closeChan:     make(chan struct{}),
 	}
+	t.log = logger.With("module", "spread.Topic", "topic", fmt.Sprintf("%p", t))
 	go t.run(ctx)
 	return t
 }
@@ -54,12 +61,15 @@ func NewTopic[T any](ctx context.Context, bufSize int) *Topic[T] {
 // ***BEWARE! The handler is executed by the broadcaster goroutine that manages the topic, which can halt the topic if the handler is expensive.
 func (t *Topic[T]) HandleSync(fn func(T)) (func(), error) {
 	if t.closed.Load() {
+		t.log.Error("tried to add sync handler to closed topic")
 		return nil, fmt.Errorf("topic is closed")
 	}
 	key := reflect.ValueOf(fn).Pointer()
+	t.log.Debug("adding sync handler")
 	t.controlChan <- handlerSync[T](fn)
 	return func() {
 		if !t.closed.Load() {
+			t.log.Debug("sync handler is removing itself")
 			t.controlChan <- removeHandlerSync(key)
 		}
 	}, nil
@@ -70,12 +80,15 @@ func (t *Topic[T]) HandleSync(fn func(T)) (func(), error) {
 // Making use of the context is recommended for graceful shutdown.
 func (t *Topic[T]) HandleAsync(fn func(context.Context, T)) (func(), error) {
 	if t.closed.Load() {
+		t.log.Error("tried to add async handler to closed topic")
 		return nil, fmt.Errorf("topic is closed")
 	}
 	key := reflect.ValueOf(fn).Pointer()
+	t.log.Debug("adding async handler")
 	t.controlChan <- handlerAsync[T](fn)
 	return func() {
 		if !t.closed.Load() {
+			t.log.Debug("async handler is removing itself")
 			t.controlChan <- removeHandlerSync(key)
 		}
 	}, nil
@@ -92,13 +105,16 @@ func (t *Topic[T]) HandleAsync(fn func(context.Context, T)) (func(), error) {
 // This is the recommended way of subscribing to the topic for most use cases.
 func (t *Topic[T]) GetRecvChannel(bufSize int) (<-chan T, func(), error) {
 	if t.closed.Load() {
+		t.log.Error("tried to get recv channel from closed topic")
 		return nil, nil, fmt.Errorf("topic is closed")
 	}
 
 	ch := make(chan T, bufSize)
+	t.log.Debug("adding recv channel")
 	t.controlChan <- newRecvChannel[T](ch)
 	return ch, func() {
 		if !t.closed.Load() {
+			t.log.Debug("recv channel is removing itself")
 			t.controlChan <- removeRecvChannel(reflect.ValueOf(ch).Pointer())
 		}
 	}, nil
@@ -112,14 +128,17 @@ func (t *Topic[T]) GetRecvChannel(bufSize int) (<-chan T, func(), error) {
 //  2. Prevents any new messages
 //  3. Finishes broadcasting the messages already sent.
 //  4. Closes without waiting for the subscribers to finish processing.
-func (t *Topic[T]) Close() {
+func (t *Topic[T]) close() {
 	if t.closed.CompareAndSwap(false, true) {
+		t.log.Debug("closing topic")
 		close(t.closeChan)
-		for range t.controlChan {
-			// drain controlChan
-		}
 		close(t.controlChan)
+		for recvChanPtr, recvChan := range t.recvChannels {
+			close(recvChan)
+			delete(t.recvChannels, recvChanPtr)
+		}
 		close(t.dataChan)
+		t.log.Info("closed topic")
 	}
 }
 
@@ -128,13 +147,17 @@ func (t *Topic[T]) Close() {
 // Same semantics as sending to a buffered channel.
 func (t *Topic[T]) Publish(data T) error {
 	if t.closed.Load() {
+		t.log.Error("tried to publish to closed topic", "data", data)
 		return fmt.Errorf("topic is closed")
 	}
+	t.log.Debug("publishing data", "data", data)
 	t.dataChan <- data
+	t.log.Debug("published data", "data", data)
 	return nil
 }
 
 func (t *Topic[T]) handle(ctx context.Context, data T) {
+	t.log.Debug("handling data", "data", data)
 	for i := range t.handlersSync {
 		t.handlersSync[i](data)
 	}
@@ -146,84 +169,60 @@ func (t *Topic[T]) handle(ctx context.Context, data T) {
 		case t.recvChannels[i] <- data:
 		default:
 			// TODO: notify the client in some way
+			t.log.Warn("recv channel is full, removing it", "recvChan", t.recvChannels[i])
 			close(t.recvChannels[i])
 			delete(t.recvChannels, i)
 		}
 	}
+	t.log.Debug("handled data", "data", data)
 }
 
 func (t *Topic[T]) run(ctx context.Context) error {
 	if t.closed.Load() {
+		t.log.Error("tried to start closed topic")
 		return fmt.Errorf("topic is closed")
 	}
+	t.log.Info("starting topic")
 	for {
 		select {
 		case <-ctx.Done():
-			t.Close()
+			t.log.Info("topic context got triggered", "err", ctx.Err())
+			t.close()
+			return nil
 		case ctrl := <-t.controlChan:
 			switch v := ctrl.(type) {
 			case handlerSync[T]:
 				key := reflect.ValueOf(v).Pointer()
 				t.handlersSync[key] = v
+				t.log.Info("added sync handler")
 			case removeHandlerSync:
-				delete(t.handlersSync, uintptr(v))
+				key := uintptr(v)
+				delete(t.handlersSync, key)
+				t.log.Info("removed sync handler")
 			case handlerAsync[T]:
 				key := reflect.ValueOf(v).Pointer()
 				t.handlersAsync[key] = v
+				t.log.Info("added async handler")
 			case removeHandlerAsync:
-				delete(t.handlersAsync, uintptr(v))
+				key := uintptr(v)
+				delete(t.handlersAsync, key)
+				t.log.Info("removed async handler")
 			case newRecvChannel[T]:
 				key := reflect.ValueOf(v).Pointer()
 				t.recvChannels[key] = v
+				t.log.Info("added recv channel")
 			case removeRecvChannel:
-				delete(t.recvChannels, uintptr(v))
+				key := uintptr(v)
+				close(t.recvChannels[key])
+				delete(t.recvChannels, key)
+				t.log.Info("removed recv channel")
 			}
 		case data := <-t.dataChan:
 			t.handle(ctx, data)
+			t.log.Debug("handled data", "data", data)
 		case <-t.closeChan:
+			t.log.Debug("topic manager goroutine is exiting")
 			return nil
 		}
 	}
 }
-
-// func main() {
-// 	ctx, cancel := context.WithCancel(context.Background())
-// 	t := NewTopic[int](ctx, 5)
-
-// 	removeSync, _ := t.HandleSync(func(data int) {
-// 		fmt.Printf("sync handler: %d\n", data)
-// 	})
-
-// 	recvChan, removeRecvChan, _ := t.GetRecvChannel(2)
-// 	go func() {
-// 		for data := range recvChan {
-// 			fmt.Printf("recv channel: %d\n", data)
-// 		}
-// 	}()
-
-// 	t.Publish(1)
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	removeRecvChan()
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	t.Publish(2)
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	removeSync()
-// 	t.HandleAsync(func(_ctx context.Context, data int) {
-// 		fmt.Printf("async handler: %d\n", data)
-// 	})
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	t.Publish(3)
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	cancel()
-// 	time.Sleep(100 * time.Millisecond)
-
-// 	err := t.Publish(4)
-// 	if err == nil {
-// 		log.Fatal("should not be able to publish after closing the topic")
-// 	}
-// }
