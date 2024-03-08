@@ -140,39 +140,24 @@ func Run(ctx context.Context) error {
 	}
 
 	go func() {
-		logger.Info("http server started listening on", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("error starting http server", "err", err)
+		// Wait for the context be notified of an interrupt
+		<-ctx.Done()
+
+		// Topic is already listening to the context,
+		// we know it will send close signals to the handlers
+		// We wait for them to return for a bit
+		time.Sleep(100 * time.Millisecond)
+
+		// Give the server time to close all the connections
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		if err := httpServer.Shutdown(timeoutCtx); err != nil {
+			logger.Error("error closing http server", "err", err)
 		}
 	}()
 
-	<-ctx.Done()
-	logger.Info("received interrupt, shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error("error shutting down http server", "err", err)
-	}
-	time.Sleep(100 * time.Millisecond) // Wait for websocket connections to close
-	logger.Info("shutdown complete")
-
-	return shutdownCtx.Err()
-
-	// var wg sync.WaitGroup
-	// wg.Add(1)
-	// go func() {
-	// 	defer wg.Done()
-	// 	<-ctx.Done()
-	// 	logger.Info("received interrupt, shutting down")
-	// 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	// 	defer cancel()
-	// 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-	// 		logger.Error("error shutting down http server", "err", err)
-	// 	}
-	// 	time.Sleep(100 * time.Millisecond) // Wait for websocket connections to close
-	// }()
-	// wg.Wait()
-	// return nil
+	logger.Info("http server started listening on", "addr", httpServer.Addr)
+	return httpServer.ListenAndServe()
 }
 
 func main() {
